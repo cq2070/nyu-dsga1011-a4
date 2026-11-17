@@ -44,7 +44,40 @@ def custom_transform(example):
 
     # You should update example["text"] using your transformation
 
-    raise NotImplementedError
+    import random
+    import re
+
+    text = example["text"]
+    rng = random.Random(text)
+    sentiment_words = {
+        "amazing", "awesome", "beautiful", "brilliant", "enjoyable",
+        "excellent", "fantastic", "favorite", "great", "hilarious",
+        "loved", "perfect", "superb", "wonderful",
+        "annoying", "awful", "boring", "crappy", "disappointing",
+        "dreadful", "frustrating", "hated", "horrible", "pathetic",
+        "stupid", "terrible", "unwatchable", "worst",
+    }
+
+    def transpose(match):
+        word = match.group()
+        if word.startswith("<"):
+            return word
+
+        rate = 0.90 if word.lower() in sentiment_words else 0.35
+        if rng.random() >= rate:
+            return word
+
+        positions = [
+            i for i in range(len(word) - 1)
+            if word[i].lower() != word[i + 1].lower()
+        ]
+        if not positions:
+            return word
+
+        i = rng.choice(positions)
+        return word[:i] + word[i + 1] + word[i] + word[i + 2:]
+
+    example["text"] = re.sub(r"<[^>]*>|\b[A-Za-z]{5,}\b", transpose, text)
 
     ##### YOUR CODE ENDS HERE ######
 

@@ -9,7 +9,7 @@ import wandb
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
 from transformers import GenerationConfig
-from load_data import load_t5_data
+from load_data import get_dataloader, load_t5_data
 from utils import compute_metrics, save_queries_and_records
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -48,6 +48,7 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--test_batch_size', type=int, default=16)
 
+    parser.add_argument("--test_only", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -128,26 +129,68 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
 
     return total_loss / total_tokens
         
-def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
-    '''
-    You must implement the evaluation loop to be using during training. We recommend keeping track
-    of the model loss on the SQL queries, the metrics compute_metrics returns (save_queries_and_records should be helpful)
-    and the model's syntax error rate. 
-
-    To compute non-loss metrics, you will need to perform generation with the model. Greedy decoding or beam search
-    should both provide good results. If you find that this component of evaluation takes too long with your compute,
-    we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
-    '''
-    # TODO
+@torch.no_grad()
+def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path,
+               gt_record_path, model_record_path):
     model.eval()
-    return 0, 0, 0, 0, 0
+    tokenizer = dev_loader.dataset.tokenizer
+    criterion = nn.CrossEntropyLoss(reduction="sum", ignore_index=PAD_IDX)
+    total_loss = 0.0
+    total_tokens = 0
+    queries = []
+
+    for encoder, mask, decoder, targets, starts in tqdm(dev_loader, desc="Dev"):
+        encoder, mask, decoder, targets, starts = (
+            tensor.to(model.device)
+            for tensor in (encoder, mask, decoder, targets, starts)
+        )
+        logits = model(
+            input_ids=encoder,
+            attention_mask=mask,
+            decoder_input_ids=decoder,
+        ).logits
+        total_loss += criterion(
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
+        ).item()
+        total_tokens += targets.ne(PAD_IDX).sum().item()
+
+        queries.extend(generate_queries(model, tokenizer, encoder, mask, starts))
+
+    assert len(queries) == len(dev_loader.dataset)
+    save_queries_and_records(queries, model_sql_path, model_record_path)
+    sql_em, record_em, record_f1, errors = compute_metrics(
+        gt_sql_pth, model_sql_path, gt_record_path, model_record_path
+    )
+    error_rate = sum(bool(error) for error in errors) / len(queries)
+    return total_loss / total_tokens, record_f1, record_em, sql_em, error_rate
         
+@torch.no_grad()
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
-    '''
-    You must implement inference to compute your model's generated SQL queries and its associated 
-    database records. Implementation should be very similar to eval_epoch.
-    '''
-    pass
+    model.eval()
+    tokenizer = test_loader.dataset.tokenizer
+    queries = []
+
+    for encoder, mask, starts in tqdm(test_loader, desc="Test"):
+        queries.extend(generate_queries(model, tokenizer, encoder, mask, starts))
+
+    assert len(queries) == len(test_loader.dataset)
+    save_queries_and_records(queries, model_sql_path, model_record_path)
+    print(f"Saved {len(queries)} test queries to {model_sql_path}")
+
+
+def generate_queries(model, tokenizer, encoder, mask, starts, max_new_tokens=512):
+    generated = model.generate(
+        input_ids=encoder.to(model.device),
+        attention_mask=mask.to(model.device),
+        decoder_start_token_id=tokenizer.convert_tokens_to_ids("<extra_id_0>"),
+        decoder_input_ids=starts.to(model.device),
+        max_new_tokens=max_new_tokens,
+        num_beams=1,
+        do_sample=False,
+    )
+    return [query.strip() for query in tokenizer.batch_decode(
+        generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )]
 
 def main():
     # Get key arguments
@@ -155,6 +198,16 @@ def main():
     if args.use_wandb:
         # Recommended: Using wandb (or tensorboard) for result logging can make experimentation easier
         setup_wandb(args)
+
+    if args.test_only:
+        model = load_model_from_checkpoint(args, best=True)
+        test_loader = get_dataloader(args.test_batch_size, "test")
+        model_type = "ft" if args.finetune else "scr"
+        stem = f"t5_{model_type}_{args.experiment_name}_test"
+        test_inference(
+            args, model, test_loader, f"results/{stem}.sql", f"records/{stem}.pkl"
+        )
+        return
 
     # Load the data and the model
     train_loader, dev_loader, test_loader = load_t5_data(args.batch_size, args.test_batch_size)
@@ -181,10 +234,7 @@ def main():
     print(f"Dev set results: Loss: {dev_loss}, Record F1: {dev_record_f1}, Record EM: {dev_record_em}, SQL EM: {dev_sql_em}")
     print(f"Dev set results: {dev_error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
-    # Test set
-    model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_test.sql')
-    model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_test.pkl')
-    test_inference(args, model, test_loader, model_sql_path, model_record_path)
+
 
 if __name__ == "__main__":
     main()
